@@ -1,0 +1,2 @@
+tableauserverclient>=0.30
+tomli; python_version < "3.11"

@@ -1,0 +1,15 @@
+# Copy this file to config.toml and fill in your values.
+# No secrets here — the PAT goes in env vars TABLEAU_PAT_NAME / TABLEAU_PAT_SECRET.
+
+# Your sandbox pod base URL (NO trailing /#/site/...). Find it in your sandbox URL.
+server_url = "https://10ax.online.tableau.com"
+
+# The site name (content URL) — the part after /#/site/ in your sandbox URL.
+site_content_url = "yoursite123456"
+
+# Tableau project to publish into (the default project is usually "Default").
+project_name = "Default"
+
+# Workbook name as it will appear in Tableau, and the local file to upload.
+workbook_name = "NBA Overview"
+workbook_file = "../workbooks/nba_overview.twbx"
