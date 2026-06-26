@@ -3,3 +3,9 @@ config.toml
 *.pyc
 __pycache__/
 .DS_Store
+
+# Secrets — never commit private keys or credentials
+secrets/
+*.p8
+*.pem
+*.key
