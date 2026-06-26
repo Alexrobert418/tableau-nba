@@ -9,3 +9,9 @@ secrets/
 *.p8
 *.pem
 *.key
+
+# Build artifacts — regenerable from the scripts; .twbx/.hyper also embed data
+build/
+hyperd.log
+*.twbx
+*.hyper
