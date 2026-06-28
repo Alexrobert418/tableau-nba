@@ -1,9 +1,12 @@
 """Build a Tableau .hyper extract from the dbt-modeled NBA marts in Snowflake.
 
-Reads `NBA.DBT_DEMO.MART_TEAM_SCORING_BY_SEASON` and writes a single-table
-Hyper extract (schema "Extract", table "Extract" — the Tableau convention) so a
-workbook can embed it. Connection uses key-pair auth (same key the Snowflake MCP
-uses); we only read the key to authenticate.
+Reads `NBA.DBT_DEMO.FCT_GAME` (joined to DIM_TEAM), unpivots each game into one
+row per team, and aggregates to a team x season grain with games / wins /
+points-for / points-against. A workbook embeds this single Hyper table and
+derives ratios (PPG, opponent PPG, win %) as calculated fields.
+
+Connection uses key-pair auth (same key the Snowflake MCP uses); we only read
+the key to authenticate.
 
 Usage:  python publish/build_extract.py [output.hyper]
 Env overrides: SNOWFLAKE_ACCOUNT, SNOWFLAKE_USER, SNOWFLAKE_ROLE,
@@ -39,22 +42,34 @@ from tableauhyperapi import (
     Telemetry,
 )
 
+# Team x season aggregates, built from game-level fct_game (unpivoted home/away).
+# Limited to 1996+ for a clean, modern, 30-team view.
 QUERY = """
+WITH per_team AS (
+    SELECT season_id, season_type, team_id_home AS team_id,
+           pts_home AS pts_for, pts_away AS pts_against,
+           IFF(wl_home = 'W', 1, 0) AS win
+    FROM NBA.DBT_DEMO.FCT_GAME
+    UNION ALL
+    SELECT season_id, season_type, team_id_away AS team_id,
+           pts_away AS pts_for, pts_home AS pts_against,
+           IFF(wl_away = 'W', 1, 0) AS win
+    FROM NBA.DBT_DEMO.FCT_GAME
+)
 SELECT
-    season_id,
-    MOD(season_id, 10000) AS season_year,
-    CASE FLOOR(season_id / 10000)
-        WHEN 1 THEN 'Pre-season'
-        WHEN 2 THEN 'Regular'
-        WHEN 4 THEN 'Playoffs'
-        ELSE 'Other'
-    END AS season_type,
-    team_id,
-    team_name,
-    games,
-    made_field_goals,
-    free_throw_events
-FROM NBA.DBT_DEMO.MART_TEAM_SCORING_BY_SEASON
+    p.season_id,
+    MOD(p.season_id, 10000)         AS season_year,
+    p.season_type,
+    p.team_id,
+    t.team_name,
+    COUNT(*)                        AS games,
+    SUM(p.win)                      AS wins,
+    SUM(p.pts_for)                  AS points_for,
+    SUM(p.pts_against)              AS points_against
+FROM per_team p
+JOIN NBA.DBT_DEMO.DIM_TEAM t ON t.team_id = p.team_id
+WHERE MOD(p.season_id, 10000) >= 1996
+GROUP BY 1, 2, 3, 4, 5
 """
 
 EXTRACT_TABLE = TableName("Extract", "Extract")
@@ -80,9 +95,8 @@ def fetch_rows():
         rows = cur.fetchall()
     finally:
         conn.close()
-    # Normalize: ints for numeric cols, str/None for text.
     norm = []
-    for (sid, syear, stype, tid, tname, games, fg, ft) in rows:
+    for (sid, syear, stype, tid, tname, games, wins, pf, pa) in rows:
         norm.append([
             int(sid),
             int(syear),
@@ -90,8 +104,9 @@ def fetch_rows():
             None if tid is None else int(tid),
             None if tname is None else str(tname),
             None if games is None else int(games),
-            None if fg is None else int(fg),
-            None if ft is None else int(ft),
+            None if wins is None else int(wins),
+            None if pf is None else float(pf),
+            None if pa is None else float(pa),
         ])
     return norm
 
@@ -113,8 +128,9 @@ def write_hyper(rows, hyper_path: Path) -> None:
             col("TEAM_ID", SqlType.big_int()),
             col("TEAM_NAME", SqlType.text()),
             col("GAMES", SqlType.big_int()),
-            col("MADE_FIELD_GOALS", SqlType.big_int()),
-            col("FREE_THROW_EVENTS", SqlType.big_int()),
+            col("WINS", SqlType.big_int()),
+            col("POINTS_FOR", SqlType.double()),
+            col("POINTS_AGAINST", SqlType.double()),
         ],
     )
 
@@ -136,6 +152,10 @@ def main() -> None:
     rows = fetch_rows()
     print(f"Fetched {len(rows)} rows from Snowflake.")
     if rows:
+        types = sorted({r[2] for r in rows})
+        years = sorted({r[1] for r in rows})
+        print("season_type values:", types)
+        print("season_year range:", years[0], "-", years[-1])
         print("Sample:", rows[0])
     write_hyper(rows, out)
 

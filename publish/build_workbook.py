@@ -1,13 +1,14 @@
 """Assemble a Tableau .twbx from a .hyper extract by generating the .twb XML.
 
-Tableau has no headless authoring API, so we hand-author the workbook. Layout
-of the "NBA Scoring Overview" dashboard (Lynk-branded, purple #6749F4 on white):
+Tableau has no headless authoring API, so we hand-author the workbook. The
+"NBA Scoring Overview" dashboard (Lynk-branded, purple #6749F4 on white):
   - purple title banner
-  - 3 KPI stat tiles  : Total Made FGs / Seasons / Teams (regular season)
-    (label = a text zone; value = a title-less worksheet so the number is clean)
-  - line worksheet    : league-wide made field goals by season (purple)
-  - bar worksheet     : made field goals by team (near-black, sorted, all 30)
-All worksheets read the embedded Hyper extract via a federated connection.
+  - 4 KPI stat tiles : Total Points / League PPG / Seasons / Teams
+  - line   : league points-per-game by season (purple)
+  - scatter: offense (PPG) vs defense (opp PPG) per team, colored by win %
+  - bar    : win % by team (near-black, sorted, all 30)
+Ratios (PPG, opp PPG, win %) are aggregate calculated fields over the embedded
+Hyper extract (team x season grain). A SEASON_TYPE filter card is global.
 
 Usage:  python publish/build_workbook.py <input.hyper> <output.twbx>
 """
@@ -17,22 +18,42 @@ import sys
 import zipfile
 from pathlib import Path
 
-# Relative path of the extract inside the .twbx package; connection dbname must match.
 HYPER_REL = "Data/nba_team_scoring.hyper"
-
 DS = "federated.nba"
 HYPERCONN = "hyper.nba"
 
-# --- Lynk brand palette (extracted from getlynk.ai) ---
-ACCENT = "#6749F4"   # Lynk purple — hero accent
-INK = "#171717"      # near-black — bars / body
-LABEL = "#78737D"    # muted grey — KPI labels
+# --- Lynk brand palette (from getlynk.ai) ---
+ACCENT = "#6749F4"
+INK = "#171717"
+LABEL = "#78737D"
 BANNERTXT = "#FFFFFF"
+
 BLANK_TITLE = "<layout-options><title><formatted-text><run>&#160;</run></formatted-text></title></layout-options>"
 
+# Regular-season filter applied to every worksheet (the season-type filter card
+# lets a signed-in viewer switch this).
+FILTER = f"""          <filter class='categorical' column='[{DS}].[none:SEASON_TYPE:nk]'>
+            <groupfilter function='member' level='[none:SEASON_TYPE:nk]' member='&quot;Regular Season&quot;' />
+          </filter>
+          <slices>
+            <column>[{DS}].[none:SEASON_TYPE:nk]</column>
+          </slices>"""
 
-def kpi_worksheet(name: str, value_instance: str, deps_extra: str) -> str:
-    """A title-less BAN worksheet: one big purple number, filtered to regular season."""
+SEASON_TYPE_DEP = "<column datatype='string' name='[SEASON_TYPE]' role='dimension' type='nominal' />\n            <column-instance column='[SEASON_TYPE]' derivation='None' name='[none:SEASON_TYPE:nk]' pivot='key' type='nominal' />"
+
+# base measure columns referenced by the calcs (needed in dependencies)
+BASE_MEASURES = (
+    "<column datatype='integer' name='[GAMES]' role='measure' type='quantitative' />\n"
+    "            <column datatype='integer' name='[WINS]' role='measure' type='quantitative' />\n"
+    "            <column datatype='real' name='[POINTS_FOR]' role='measure' type='quantitative' />\n"
+    "            <column datatype='real' name='[POINTS_AGAINST]' role='measure' type='quantitative' />"
+)
+CALC_PPG = "<column caption='Points Per Game' datatype='real' name='[PPG]' role='measure' type='quantitative'><calculation class='tableau' formula='SUM([POINTS_FOR]) / SUM([GAMES])' /></column>"
+CALC_OPP = "<column caption='Opp Points Per Game' datatype='real' name='[OPP_PPG]' role='measure' type='quantitative'><calculation class='tableau' formula='SUM([POINTS_AGAINST]) / SUM([GAMES])' /></column>"
+CALC_WIN = "<column caption='Win %' datatype='real' default-format='p0%' name='[WIN_PCT]' role='measure' type='quantitative'><calculation class='tableau' formula='SUM([WINS]) / SUM([GAMES])' /></column>"
+
+
+def kpi(name: str, value_ref: str, deps: str) -> str:
     return f"""    <worksheet name='{name}'>
       {BLANK_TITLE}
       <table>
@@ -41,21 +62,15 @@ def kpi_worksheet(name: str, value_instance: str, deps_extra: str) -> str:
             <datasource caption='NBA Team Scoring (dbt)' name='{DS}' />
           </datasources>
           <datasource-dependencies datasource='{DS}'>
-            <column datatype='string' name='[SEASON_TYPE]' role='dimension' type='nominal' />
-            {deps_extra}
-            <column-instance column='[SEASON_TYPE]' derivation='None' name='[none:SEASON_TYPE:nk]' pivot='key' type='nominal' />
+            {SEASON_TYPE_DEP}
+            {deps}
           </datasource-dependencies>
-          <filter class='categorical' column='[{DS}].[none:SEASON_TYPE:nk]'>
-            <groupfilter function='member' level='[none:SEASON_TYPE:nk]' member='&quot;Regular&quot;' />
-          </filter>
-          <slices>
-            <column>[{DS}].[none:SEASON_TYPE:nk]</column>
-          </slices>
+{FILTER}
         </view>
         <style>
           <style-rule element='mark'>
             <format attr='mark-color' value='{ACCENT}' />
-            <format attr='font-size' value='26' />
+            <format attr='font-size' value='24' />
           </style-rule>
         </style>
         <panes>
@@ -63,7 +78,7 @@ def kpi_worksheet(name: str, value_instance: str, deps_extra: str) -> str:
             <view><breakdown value='auto' /></view>
             <mark class='Text' />
             <encodings>
-              <text column='[{DS}].{value_instance}' />
+              <text column='[{DS}].{value_ref}' />
             </encodings>
           </pane>
         </panes>
@@ -75,10 +90,8 @@ def kpi_worksheet(name: str, value_instance: str, deps_extra: str) -> str:
 
 
 def label_zone(zid: int, x: int, w: int, text: str) -> str:
-    return f"""          <zone h='2200' id='{zid}' type-v2='text' w='{w}' x='{x}' y='5000'>
-            <formatted-text>
-              <run bold='true' fontcolor='{LABEL}' fontsize='10'>{text}</run>
-            </formatted-text>
+    return f"""          <zone h='1800' id='{zid}' type-v2='text' w='{w}' x='{x}' y='4000'>
+            <formatted-text><run bold='true' fontcolor='{LABEL}' fontsize='9'>{text}</run></formatted-text>
             <zone-style>
               <format attr='background-color' value='#FFFFFF' />
               <format attr='border-style' value='none' />
@@ -91,7 +104,7 @@ def label_zone(zid: int, x: int, w: int, text: str) -> str:
 
 
 def number_zone(zid: int, x: int, w: int, name: str) -> str:
-    return f"""          <zone h='8800' id='{zid}' name='{name}' w='{w}' x='{x}' y='7200'>
+    return f"""          <zone h='7000' id='{zid}' name='{name}' w='{w}' x='{x}' y='5800'>
             <zone-style>
               <format attr='border-color' value='#E5E5E5' />
               <format attr='border-style' value='solid' />
@@ -102,25 +115,29 @@ def number_zone(zid: int, x: int, w: int, name: str) -> str:
 """
 
 
+def chart_zone(zid: int, name: str, y: int, h: int) -> str:
+    return f"""          <zone h='{h}' id='{zid}' name='{name}' w='100000' x='0' y='{y}'>
+            <zone-style>
+              <format attr='border-style' value='none' />
+              <format attr='border-width' value='0' />
+              <format attr='margin' value='6' />
+            </zone-style>
+          </zone>
+"""
+
+
 KPIS = (
-    kpi_worksheet(
-        "Total Made FGs",
-        "[sum:MADE_FIELD_GOALS:qk]",
-        "<column datatype='integer' name='[MADE_FIELD_GOALS]' caption='Made Field Goals' role='measure' type='quantitative' />\n"
-        "            <column-instance column='[MADE_FIELD_GOALS]' derivation='Sum' name='[sum:MADE_FIELD_GOALS:qk]' pivot='key' type='quantitative' />",
-    )
-    + kpi_worksheet(
-        "Seasons",
-        "[ctd:SEASON_YEAR:qk]",
+    kpi("Total Points", "[sum:POINTS_FOR:qk]",
+        "<column datatype='real' default-format='#,##0' name='[POINTS_FOR]' caption='Points For' role='measure' type='quantitative' />\n"
+        "            <column-instance column='[POINTS_FOR]' derivation='Sum' name='[sum:POINTS_FOR:qk]' pivot='key' type='quantitative' />")
+    + kpi("League PPG", "[PPG]",
+        BASE_MEASURES + "\n            " + CALC_PPG)
+    + kpi("Seasons", "[ctd:SEASON_YEAR:qk]",
         "<column datatype='integer' name='[SEASON_YEAR]' caption='Season' role='dimension' type='ordinal' />\n"
-        "            <column-instance column='[SEASON_YEAR]' derivation='CountD' name='[ctd:SEASON_YEAR:qk]' pivot='key' type='quantitative' />",
-    )
-    + kpi_worksheet(
-        "Teams",
-        "[ctd:TEAM_ID:qk]",
+        "            <column-instance column='[SEASON_YEAR]' derivation='CountD' name='[ctd:SEASON_YEAR:qk]' pivot='key' type='quantitative' />")
+    + kpi("Teams", "[ctd:TEAM_ID:qk]",
         "<column datatype='integer' name='[TEAM_ID]' role='dimension' type='ordinal' />\n"
-        "            <column-instance column='[TEAM_ID]' derivation='CountD' name='[ctd:TEAM_ID:qk]' pivot='key' type='quantitative' />",
-    )
+        "            <column-instance column='[TEAM_ID]' derivation='CountD' name='[ctd:TEAM_ID:qk]' pivot='key' type='quantitative' />")
 )
 
 TWB = f"""<?xml version='1.0' encoding='utf-8' ?>
@@ -145,8 +162,9 @@ TWB = f"""<?xml version='1.0' encoding='utf-8' ?>
           <map key='[TEAM_ID]' value='[Extract].[TEAM_ID]' />
           <map key='[TEAM_NAME]' value='[Extract].[TEAM_NAME]' />
           <map key='[GAMES]' value='[Extract].[GAMES]' />
-          <map key='[MADE_FIELD_GOALS]' value='[Extract].[MADE_FIELD_GOALS]' />
-          <map key='[FREE_THROW_EVENTS]' value='[Extract].[FREE_THROW_EVENTS]' />
+          <map key='[WINS]' value='[Extract].[WINS]' />
+          <map key='[POINTS_FOR]' value='[Extract].[POINTS_FOR]' />
+          <map key='[POINTS_AGAINST]' value='[Extract].[POINTS_AGAINST]' />
         </cols>
       </connection>
       <column datatype='integer' name='[SEASON_ID]' role='dimension' type='ordinal' />
@@ -155,36 +173,38 @@ TWB = f"""<?xml version='1.0' encoding='utf-8' ?>
       <column datatype='integer' name='[TEAM_ID]' role='dimension' type='ordinal' />
       <column datatype='string' name='[TEAM_NAME]' caption='Team' role='dimension' type='nominal' />
       <column datatype='integer' name='[GAMES]' role='measure' type='quantitative' />
-      <column datatype='integer' name='[MADE_FIELD_GOALS]' caption='Made Field Goals' role='measure' type='quantitative' />
-      <column datatype='integer' name='[FREE_THROW_EVENTS]' caption='Free Throw Events' role='measure' type='quantitative' />
+      <column datatype='integer' name='[WINS]' role='measure' type='quantitative' />
+      <column datatype='real' default-format='#,##0' name='[POINTS_FOR]' caption='Points For' role='measure' type='quantitative' />
+      <column datatype='real' default-format='#,##0' name='[POINTS_AGAINST]' caption='Points Against' role='measure' type='quantitative' />
+      <column caption='Points Per Game' datatype='real' name='[PPG]' role='measure' type='quantitative'>
+        <calculation class='tableau' formula='SUM([POINTS_FOR]) / SUM([GAMES])' />
+      </column>
+      <column caption='Opp Points Per Game' datatype='real' name='[OPP_PPG]' role='measure' type='quantitative'>
+        <calculation class='tableau' formula='SUM([POINTS_AGAINST]) / SUM([GAMES])' />
+      </column>
+      <column caption='Win %' datatype='real' default-format='p0%' name='[WIN_PCT]' role='measure' type='quantitative'>
+        <calculation class='tableau' formula='SUM([WINS]) / SUM([GAMES])' />
+      </column>
     </datasource>
   </datasources>
   <worksheets>
-{KPIS}    <worksheet name='Made FGs by Season'>
+{KPIS}    <worksheet name='PPG by Season'>
       <table>
         <view>
           <datasources>
             <datasource caption='NBA Team Scoring (dbt)' name='{DS}' />
           </datasources>
           <datasource-dependencies datasource='{DS}'>
+            {SEASON_TYPE_DEP}
             <column datatype='integer' name='[SEASON_YEAR]' caption='Season' role='dimension' type='ordinal' />
-            <column datatype='string' name='[SEASON_TYPE]' role='dimension' type='nominal' />
-            <column datatype='integer' name='[MADE_FIELD_GOALS]' caption='Made Field Goals' role='measure' type='quantitative' />
             <column-instance column='[SEASON_YEAR]' derivation='None' name='[none:SEASON_YEAR:ok]' pivot='key' type='ordinal' />
-            <column-instance column='[SEASON_TYPE]' derivation='None' name='[none:SEASON_TYPE:nk]' pivot='key' type='nominal' />
-            <column-instance column='[MADE_FIELD_GOALS]' derivation='Sum' name='[sum:MADE_FIELD_GOALS:qk]' pivot='key' type='quantitative' />
+            {BASE_MEASURES}
+            {CALC_PPG}
           </datasource-dependencies>
-          <filter class='categorical' column='[{DS}].[none:SEASON_TYPE:nk]'>
-            <groupfilter function='member' level='[none:SEASON_TYPE:nk]' member='&quot;Regular&quot;' />
-          </filter>
-          <slices>
-            <column>[{DS}].[none:SEASON_TYPE:nk]</column>
-          </slices>
+{FILTER}
         </view>
         <style>
-          <style-rule element='mark'>
-            <format attr='mark-color' value='{ACCENT}' />
-          </style-rule>
+          <style-rule element='mark'><format attr='mark-color' value='{ACCENT}' /></style-rule>
         </style>
         <panes>
           <pane selection-relaxation-option='selection-relaxation-allow'>
@@ -192,36 +212,60 @@ TWB = f"""<?xml version='1.0' encoding='utf-8' ?>
             <mark class='Line' />
           </pane>
         </panes>
-        <rows>[{DS}].[sum:MADE_FIELD_GOALS:qk]</rows>
+        <rows>[{DS}].[PPG]</rows>
         <cols>[{DS}].[none:SEASON_YEAR:ok]</cols>
       </table>
     </worksheet>
-    <worksheet name='Made FGs by Team'>
+    <worksheet name='PPG Heatmap'>
       <table>
         <view>
           <datasources>
             <datasource caption='NBA Team Scoring (dbt)' name='{DS}' />
           </datasources>
           <datasource-dependencies datasource='{DS}'>
+            {SEASON_TYPE_DEP}
+            <column datatype='integer' name='[SEASON_YEAR]' caption='Season' role='dimension' type='ordinal' />
+            <column-instance column='[SEASON_YEAR]' derivation='None' name='[none:SEASON_YEAR:ok]' pivot='key' type='ordinal' />
             <column datatype='string' name='[TEAM_NAME]' caption='Team' role='dimension' type='nominal' />
-            <column datatype='string' name='[SEASON_TYPE]' role='dimension' type='nominal' />
-            <column datatype='integer' name='[MADE_FIELD_GOALS]' caption='Made Field Goals' role='measure' type='quantitative' />
             <column-instance column='[TEAM_NAME]' derivation='None' name='[none:TEAM_NAME:nk]' pivot='key' type='nominal' />
-            <column-instance column='[SEASON_TYPE]' derivation='None' name='[none:SEASON_TYPE:nk]' pivot='key' type='nominal' />
-            <column-instance column='[MADE_FIELD_GOALS]' derivation='Sum' name='[sum:MADE_FIELD_GOALS:qk]' pivot='key' type='quantitative' />
+            {BASE_MEASURES}
+            {CALC_PPG}
           </datasource-dependencies>
-          <filter class='categorical' column='[{DS}].[none:SEASON_TYPE:nk]'>
-            <groupfilter function='member' level='[none:SEASON_TYPE:nk]' member='&quot;Regular&quot;' />
-          </filter>
-          <slices>
-            <column>[{DS}].[none:SEASON_TYPE:nk]</column>
-          </slices>
-          <sort class='computed' column='[{DS}].[none:TEAM_NAME:nk]' direction='DESC' using='[{DS}].[sum:MADE_FIELD_GOALS:qk]' />
+{FILTER}
+          <sort class='computed' column='[{DS}].[none:TEAM_NAME:nk]' direction='DESC' using='[{DS}].[PPG]' />
+        </view>
+        <style />
+        <panes>
+          <pane selection-relaxation-option='selection-relaxation-allow'>
+            <view><breakdown value='auto' /></view>
+            <mark class='Square' />
+            <encodings>
+              <color column='[{DS}].[PPG]' />
+            </encodings>
+          </pane>
+        </panes>
+        <rows>[{DS}].[none:TEAM_NAME:nk]</rows>
+        <cols>[{DS}].[none:SEASON_YEAR:ok]</cols>
+      </table>
+    </worksheet>
+    <worksheet name='Win Pct by Team'>
+      <table>
+        <view>
+          <datasources>
+            <datasource caption='NBA Team Scoring (dbt)' name='{DS}' />
+          </datasources>
+          <datasource-dependencies datasource='{DS}'>
+            {SEASON_TYPE_DEP}
+            <column datatype='string' name='[TEAM_NAME]' caption='Team' role='dimension' type='nominal' />
+            <column-instance column='[TEAM_NAME]' derivation='None' name='[none:TEAM_NAME:nk]' pivot='key' type='nominal' />
+            {BASE_MEASURES}
+            {CALC_WIN}
+          </datasource-dependencies>
+{FILTER}
+          <sort class='computed' column='[{DS}].[none:TEAM_NAME:nk]' direction='DESC' using='[{DS}].[WIN_PCT]' />
         </view>
         <style>
-          <style-rule element='mark'>
-            <format attr='mark-color' value='{INK}' />
-          </style-rule>
+          <style-rule element='mark'><format attr='mark-color' value='{INK}' /></style-rule>
         </style>
         <panes>
           <pane selection-relaxation-option='selection-relaxation-allow'>
@@ -230,54 +274,40 @@ TWB = f"""<?xml version='1.0' encoding='utf-8' ?>
           </pane>
         </panes>
         <rows>[{DS}].[none:TEAM_NAME:nk]</rows>
-        <cols>[{DS}].[sum:MADE_FIELD_GOALS:qk]</cols>
+        <cols>[{DS}].[WIN_PCT]</cols>
       </table>
     </worksheet>
   </worksheets>
   <dashboards>
     <dashboard name='NBA Scoring Overview'>
       <style />
-      <size maxheight='1600' maxwidth='1200' minheight='1600' minwidth='1200' />
+      <size maxheight='2000' maxwidth='1700' minheight='2000' minwidth='1700' />
       <zones>
         <zone h='100000' id='1' type-v2='layout-basic' w='100000' x='0' y='0'>
-          <zone h='5000' id='10' type-v2='text' w='100000' x='0' y='0'>
-            <formatted-text>
-              <run bold='true' fontcolor='{BANNERTXT}' fontsize='22'>NBA Scoring Overview</run>
-            </formatted-text>
+          <zone h='4000' id='10' type-v2='text' w='100000' x='0' y='0'>
+            <formatted-text><run bold='true' fontcolor='{BANNERTXT}' fontsize='22'>NBA Scoring Overview</run></formatted-text>
             <zone-style>
               <format attr='background-color' value='{ACCENT}' />
               <format attr='background-opacity' value='1.0' />
               <format attr='border-style' value='none' />
               <format attr='border-width' value='0' />
               <format attr='margin' value='0' />
-              <format attr='padding-top' value='12' />
+              <format attr='padding-top' value='10' />
               <format attr='padding-left' value='16' />
             </zone-style>
           </zone>
-{label_zone(20, 0, 33333, "TOTAL MADE FIELD GOALS")}{label_zone(21, 33333, 33334, "REGULAR SEASONS")}{label_zone(22, 66667, 33333, "TEAMS")}{number_zone(11, 0, 33333, "Total Made FGs")}{number_zone(12, 33333, 33334, "Seasons")}{number_zone(13, 66667, 33333, "Teams")}          <zone h='21000' id='14' name='Made FGs by Season' w='100000' x='0' y='16000'>
-            <zone-style>
-              <format attr='border-style' value='none' />
-              <format attr='border-width' value='0' />
-              <format attr='margin' value='6' />
-            </zone-style>
-          </zone>
-          <zone h='63000' id='15' name='Made FGs by Team' w='100000' x='0' y='37000'>
-            <zone-style>
-              <format attr='border-style' value='none' />
-              <format attr='border-width' value='0' />
-              <format attr='margin' value='6' />
-            </zone-style>
-          </zone>
-        </zone>
+{label_zone(20, 0, 25000, "TOTAL POINTS SCORED")}{label_zone(21, 25000, 25000, "LEAGUE PPG")}{label_zone(22, 50000, 25000, "REGULAR SEASONS")}{label_zone(23, 75000, 25000, "TEAMS")}{number_zone(11, 0, 25000, "Total Points")}{number_zone(12, 25000, 25000, "League PPG")}{number_zone(13, 50000, 25000, "Seasons")}{number_zone(14, 75000, 25000, "Teams")}{chart_zone(15, "PPG by Season", 13000, 13000)}{chart_zone(16, "PPG Heatmap", 26000, 36000)}{chart_zone(17, "Win Pct by Team", 62000, 38000)}        </zone>
       </zones>
     </dashboard>
   </dashboards>
   <windows source-height='30'>
-    <window class='worksheet' name='Total Made FGs' />
+    <window class='worksheet' name='Total Points' />
+    <window class='worksheet' name='League PPG' />
     <window class='worksheet' name='Seasons' />
     <window class='worksheet' name='Teams' />
-    <window class='worksheet' name='Made FGs by Season' />
-    <window class='worksheet' name='Made FGs by Team'>
+    <window class='worksheet' name='PPG by Season' />
+    <window class='worksheet' name='PPG Heatmap' />
+    <window class='worksheet' name='Win Pct by Team'>
       <cards>
         <edge name='left'>
           <strip size='160'>
@@ -290,11 +320,13 @@ TWB = f"""<?xml version='1.0' encoding='utf-8' ?>
     </window>
     <window class='dashboard' name='NBA Scoring Overview'>
       <viewpoints>
-        <viewpoint name='Total Made FGs' />
+        <viewpoint name='Total Points' />
+        <viewpoint name='League PPG' />
         <viewpoint name='Seasons' />
         <viewpoint name='Teams' />
-        <viewpoint name='Made FGs by Season' />
-        <viewpoint name='Made FGs by Team' />
+        <viewpoint name='PPG by Season' />
+        <viewpoint name='PPG Heatmap' />
+        <viewpoint name='Win Pct by Team' />
       </viewpoints>
       <active id='-1' />
     </window>
@@ -313,7 +345,7 @@ def main() -> None:
     twbx_out.parent.mkdir(parents=True, exist_ok=True)
 
     import xml.dom.minidom as minidom
-    minidom.parseString(TWB)  # well-formedness check
+    minidom.parseString(TWB)
 
     if twbx_out.exists():
         twbx_out.unlink()
