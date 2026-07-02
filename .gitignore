@@ -12,6 +12,7 @@ secrets/
 
 # Build artifacts — regenerable from the scripts; .twbx/.hyper also embed data
 build/
+site/
 hyperd.log
 *.twbx
 *.hyper
